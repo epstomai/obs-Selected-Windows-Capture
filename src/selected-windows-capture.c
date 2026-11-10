@@ -1200,26 +1200,72 @@ static void sync_composite_children(struct swc_source *ctx)
 
 	struct swc_drop_src drop[MAX_COMPOSITE];
 	int drop_n = 0;
+	int keep_child[MAX_COMPOSITE];
+	bool child_used[MAX_COMPOSITE];
+
+	for (int k = 0; k < keep_n; k++)
+		keep_child[k] = -1;
+	for (int i = 0; i < MAX_COMPOSITE; i++)
+		child_used[i] = false;
 
 	pthread_mutex_lock(&ctx->mutex);
-	for (int i = 0; i < MAX_COMPOSITE; i++) {
-		bool found = false;
-		if (!ctx->children[i].source)
+
+	/* Assign a capture to each live window by HWND first. Matching by the
+	 * class+executable key alone is not enough: several windows share a key
+	 * (Packet Tracer dialogs, Chrome windows, Notepad tabs), so a capture
+	 * whose window closed would be kept forever and drawn at its last
+	 * position as a duplicate. */
+	for (int k = 0; k < keep_n; k++) {
+		if (!keep_hwnds[k])
 			continue;
-		for (int k = 0; k < keep_n; k++) {
+		for (int i = 0; i < MAX_COMPOSITE; i++) {
+			if (!ctx->children[i].source || child_used[i])
+				continue;
 			if (ctx->children[i].method != keep_methods[k])
 				continue;
-			if (ctx->children[i].hwnd && ctx->children[i].hwnd == keep_hwnds[k]) {
-				found = true;
-				break;
-			}
-			if (ctx->children[i].filter_key[0] && strcmp(ctx->children[i].filter_key, keep_key[k]) == 0) {
-				found = true;
-				break;
-			}
+			if (ctx->children[i].hwnd != keep_hwnds[k])
+				continue;
+			keep_child[k] = i;
+			child_used[i] = true;
+			break;
 		}
-		if (!found)
+	}
+
+	/* A selected window that is not open yet has no HWND. Reuse its capture
+	 * by key so filters survive the window temporarily disappearing. */
+	for (int k = 0; k < keep_n; k++) {
+		if (keep_child[k] >= 0 || keep_hwnds[k] || !keep_key[k][0])
+			continue;
+		for (int i = 0; i < MAX_COMPOSITE; i++) {
+			if (!ctx->children[i].source || child_used[i])
+				continue;
+			if (ctx->children[i].method != keep_methods[k])
+				continue;
+			if (!ctx->children[i].filter_key[0] ||
+			    strcmp(ctx->children[i].filter_key, keep_key[k]) != 0)
+				continue;
+			keep_child[k] = i;
+			child_used[i] = true;
+			break;
+		}
+	}
+
+	for (int i = 0; i < MAX_COMPOSITE; i++) {
+		if (ctx->children[i].source && !child_used[i])
 			queue_drop_child(ctx, i, drop, &drop_n);
+	}
+
+	for (int k = 0; k < keep_n; k++) {
+		int i = keep_child[k];
+
+		if (i < 0)
+			continue;
+		if (keep_hwnds[k])
+			ctx->children[i].hwnd = keep_hwnds[k];
+		if (keep_rect[k].right > keep_rect[k].left && keep_rect[k].bottom > keep_rect[k].top)
+			ctx->children[i].rect = keep_rect[k];
+		snprintf(ctx->children[i].encoded, sizeof(ctx->children[i].encoded), "%s", keep_enc[k]);
+		snprintf(ctx->children[i].filter_key, sizeof(ctx->children[i].filter_key), "%s", keep_key[k]);
 	}
 	pthread_mutex_unlock(&ctx->mutex);
 
@@ -1227,65 +1273,24 @@ static void sync_composite_children(struct swc_source *ctx)
 
 	for (int k = 0; k < keep_n; k++) {
 		int slot = -1;
-		bool exists = false;
 		obs_source_t *src;
-		obs_source_t *retarget = NULL;
 		bool cursor;
 		bool force_sdr;
+
+		if (keep_child[k] >= 0)
+			continue;
 
 		pthread_mutex_lock(&ctx->mutex);
 		cursor = ctx->capture_cursor;
 		force_sdr = ctx->force_sdr;
 		for (int i = 0; i < MAX_COMPOSITE; i++) {
-			if (ctx->children[i].source && ctx->children[i].method == keep_methods[k]) {
-				HWND prev_hwnd = ctx->children[i].hwnd;
-				const bool hwnd_match =
-					keep_hwnds[k] && prev_hwnd == keep_hwnds[k];
-				const bool key_match = keep_key[k][0] &&
-						       strcmp(ctx->children[i].filter_key, keep_key[k]) == 0;
-				const bool adoptable = key_match && (prev_hwnd == NULL ||
-								     keep_hwnds[k] == NULL || hwnd_match);
-				if (hwnd_match || adoptable) {
-					const bool enc_changed =
-						strcmp(ctx->children[i].encoded, keep_enc[k]) != 0;
-					const bool hwnd_dead = prev_hwnd && !IsWindow(prev_hwnd);
-					const bool need_rebind = enc_changed && keep_hwnds[k] &&
-								 !hwnd_match && (hwnd_dead || !prev_hwnd);
-					if (keep_hwnds[k])
-						ctx->children[i].hwnd = keep_hwnds[k];
-					ctx->children[i].rect = keep_rect[k];
-					/* Same HWND: title-only updates must not restart WGC. */
-					if (need_rebind)
-						retarget = obs_source_get_ref(ctx->children[i].source);
-					snprintf(ctx->children[i].encoded, sizeof(ctx->children[i].encoded), "%s",
-						 keep_enc[k]);
-					snprintf(ctx->children[i].filter_key, sizeof(ctx->children[i].filter_key),
-						 "%s", keep_key[k]);
-					exists = true;
-					break;
-				}
-			}
-			if (!ctx->children[i].source && slot < 0)
+			if (!ctx->children[i].source) {
 				slot = i;
+				break;
+			}
 		}
 		pthread_mutex_unlock(&ctx->mutex);
-		if (retarget) {
-			obs_data_t *upd = obs_data_create();
-			obs_data_set_string(upd, "window", keep_enc[k]);
-			{
-				char title[512];
-				char class_name[256];
-				char exe[256];
-				if (swc_parse_encoded(keep_enc[k], title, sizeof(title), class_name,
-						      sizeof(class_name), exe, sizeof(exe)))
-					obs_data_set_int(upd, "priority",
-							 swc_window_capture_priority(exe, class_name));
-			}
-			obs_source_update(retarget, upd);
-			obs_data_release(upd);
-			obs_source_release(retarget);
-		}
-		if (exists || slot < 0)
+		if (slot < 0)
 			continue;
 
 		src = create_window_capture(keep_enc[k], keep_methods[k], cursor, force_sdr);
@@ -1714,6 +1719,10 @@ static void render_composite(struct swc_source *ctx)
 
 		if (!src)
 			continue;
+		if (child_hwnd[c] && !IsWindow(child_hwnd[c])) {
+			obs_source_release(src);
+			continue;
+		}
 		sw = obs_source_get_width(src);
 		sh = obs_source_get_height(src);
 		r = &child_rect[c];
